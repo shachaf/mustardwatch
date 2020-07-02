@@ -30,12 +30,18 @@
 // waiting for them to finish could be useful. This is made a bit tricky by the
 // above.
 
-// TODO: This has some heuristics for files not to watch. It might be good to
-// make them a bit more configurable.
+// TODO: This has some heuristics for files not to watch:
+// * Files in common global directories.
+// * Directories, except with -d (and then only directories that are open()ed).
+// * Files open()ed/access()ed for writing.
+// It might be good to make these more configurable, or to tweak them.
+// There might also be other good heuristics, like skipping files owned by root.
 
 // TODO: If ptrace slows programs down a lot, it might be useful to have a mode
 // that detects files on the first run, and then remembers them, rather than
 // clearing out the inotify list on each run.
+// This might also be implemented as a pseudo-strace mode that runs a command
+// once and writes out a list of relevant files.
 
 
 #define _GNU_SOURCE 1
@@ -85,16 +91,35 @@ typedef int16_t  S16;
 typedef int32_t  S32;
 typedef int64_t  S64;
 
+
 void print_wstatus(pid_t pid, int w) {
   printf("wstatus (%d): 0x%x. ", pid, w);
-  if (WIFEXITED(w)) printf("exited %d. ", WEXITSTATUS(w));
+  if (WIFEXITED(w))
+    printf("exited %d. ", WEXITSTATUS(w));
   if (WIFSIGNALED(w))
-    printf("signaled %d (%s)%s. ",
-           WTERMSIG(w), strsignal(WTERMSIG(w) & 0x7f),
-           WCOREDUMP(w) ? ". (core dumped)" : "");
-  if (WIFSTOPPED(w))
+    printf("signaled %d (%s). %s",
+           WTERMSIG(w), strsignal(WTERMSIG(w)),
+           WCOREDUMP(w) ? "(core dumped). " : "");
+  if (WIFSTOPPED(w)) {
     printf("stopped %d (%s). ",
            WSTOPSIG(w), strsignal(WSTOPSIG(w) & 0x7f));
+    if (WSTOPSIG(w) == SIGTRAP && w >> 16) {
+      int ptrace_event = w >> 16;
+      printf("ptrace event: ");
+      switch (ptrace_event) {
+      Case PTRACE_EVENT_FORK      : printf("FORK");
+      Case PTRACE_EVENT_VFORK     : printf("VFORK");
+      Case PTRACE_EVENT_CLONE     : printf("CLONE");
+      Case PTRACE_EVENT_EXEC      : printf("EXEC");
+      Case PTRACE_EVENT_VFORK_DONE: printf("VFORK_DONE");
+      Case PTRACE_EVENT_EXIT      : printf("EXIT");
+      Case PTRACE_EVENT_SECCOMP   : printf("SECCOMP");
+      Case PTRACE_EVENT_STOP      : printf("STOP");
+      Default                     : printf("unknown");
+      }
+      printf(". ");
+    }
+  }
   if (WIFCONTINUED(w)) printf("continued. ");
   printf("\n");
 }
@@ -523,7 +548,7 @@ Options:\n\
           event = cast(struct inotify_event *) ptr;
           if (state.verbose > 1) {
             printf("mustardwatch: ");
-            if (state.tracees_len) {
+            if (state.tracees_len > 0) {
               printf("ignoring ");
             }
             print_inotify_event(event);
