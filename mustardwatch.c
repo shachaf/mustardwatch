@@ -8,7 +8,6 @@
 // * Files that exist at startup (like stdin)
 // * rename, chmod, unlink, mkdir, bind, mknod, etc.
 // * execve, etc.
-// * Directories (e.g. when a subprocess searches for matching files)
 // * Files opened via io_uring?
 // * Files monitored via inotify? (Seems like a bad idea!)
 // * Many things no one knows about like name_to_handle_at and open_tree?
@@ -17,16 +16,15 @@
 // This program is only for amd64 Linux right now.
 
 
-// TODO: Handling directories is not difficult but it seems like it may have
-// too many false positives without more care. Maybe it should be an option. Or
-// maybe only directories that the child calls getdents on should be watched, or
-// something?
+// TODO: watch_abs_path uses realpath(), which resolves symbolic links, which
+// means that changes to symbolic links themselves aren't tracked. Maybe they
+// should be?
 
 // TODO: It might make sense not to watch files that are written to by a tracee
 // -- e.g. a common build process is to have a compiler write .o files and then
-// have a linker read them. Right now this is handled by ignoring inotify events
-// as long the the subprocess is still running, but maybe it's possible to do
-// something better.
+// have a linker read them (and cp stats the destination before copying, and so
+// on). Right now this is handled by ignoring inotify events as long the the
+// subprocess is still running, but maybe it's possible to do something better.
 
 // TODO: Some kind of server mode that restarts programs immediately rather than
 // waiting for them to finish could be useful. This is made a bit tricky by the
@@ -91,7 +89,7 @@ void print_wstatus(pid_t pid, int w) {
   printf("wstatus (%d): 0x%x. ", pid, w);
   if (WIFEXITED(w)) printf("exited %d. ", WEXITSTATUS(w));
   if (WIFSIGNALED(w))
-    printf("signaled %d (%s)%s. %s",
+    printf("signaled %d (%s)%s. ",
            WTERMSIG(w), strsignal(WTERMSIG(w) & 0x7f),
            WCOREDUMP(w) ? ". (core dumped)" : "");
   if (WIFSTOPPED(w))
@@ -100,8 +98,6 @@ void print_wstatus(pid_t pid, int w) {
   if (WIFCONTINUED(w)) printf("continued. ");
   printf("\n");
 }
-
-bool should_watch_resolved_path(char *path);
 
 Struct(InotifyEventName) {
   U32 mask;
@@ -158,11 +154,19 @@ Struct(State) {
   char **program_argv;
   int verbose;
   bool clear;
+  bool watch_directories;
 
   int inotify_fd;
   int child_pid;
   Tracee tracees[MAX_TRACEES];
   int tracees_len;
+};
+
+// How does a program use a file?
+Enum(UseType) {
+  UseType_Open, // E.g. openat
+  UseType_Check, // E.g. stat, readlink
+  // Maybe UseType_OpenAsDirectory would be good?
 };
 
 // Try to read a nul-terminated string from tracee memory, up to size n.
@@ -225,42 +229,37 @@ ssize_t get_tracee_fdpath(Tracee *tracee, int tracee_fd, char *buf, size_t buf_s
   return size;
 }
 
-bool string_starts_with(char *prefix, char *str) {
-  return strncmp(prefix, str, strlen(prefix)) == 0;
-}
+bool should_watch_resolved_path(State *state, char *path, UseType use_type) {
+  // TODO: Make this configurable?
+  static char *ignored_prefixes[] = {
+    "/bin", "/dev", "/etc", "/lib", "/proc", "/sys", "/tmp", "/usr",
+  };
 
-void watch_abs_path(State *state, char *path) {
-  char resolved_path[PATH_MAX];
-  char *success = realpath(path, resolved_path);
-  if (!success)
-    return;
-
-  if (!should_watch_resolved_path(resolved_path))
-    return;
-
-  // TODO: Figure out the right mask.
-  U32 mask = 0;
-  mask |= IN_CLOSE_WRITE | IN_MOVED_TO;
-  //mask |= IN_MODIFY;
-  //mask |= IN_CREATE | IN_DELETE;
-
-  mask |= IN_MASK_CREATE;
-
-  int wd = inotify_add_watch(state->inotify_fd, resolved_path, mask);
-  if (wd < 0) {
-    if (errno == EEXIST) {
-      // We were already watching this file.
-    } else {
-      fprintf(stderr, "can't inotify_add [%s]: %s\n", resolved_path, strerror(errno));
-    }
-  } else {
-    if (state->verbose > 1) {
-      printf("mustardwatch: Watching (%d) %s\n", wd, resolved_path);
+  for (U32 i = 0; i < numof(ignored_prefixes); i++) {
+    char *prefix = ignored_prefixes[i];
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(prefix, path, prefix_len) == 0) {
+      if (path[prefix_len] == '\0' || path[prefix_len] == '/')
+        return false;
     }
   }
+
+  // Only watch regular files (and possibly directories).
+  struct stat statbuf;
+  int res = stat(path, &statbuf);
+  if (res < 0) return false;
+  mode_t type = statbuf.st_mode & S_IFMT;
+  mode_t valid_type_mask = S_IFREG;
+  if (state->watch_directories && use_type == UseType_Open)
+    valid_type_mask |= S_IFDIR;
+  if (!(type & valid_type_mask)) return false;
+
+  // Could also ignore files owned by root or other heuristics.
+
+  return true;
 }
 
-void handle_path_at(State *state, Tracee *tracee,
+void handle_path_at(State *state, Tracee *tracee, UseType use_type,
                    int at_fd, U64 path_addr) {
   char path[PATH_MAX];
   bool found = read_tracee_string(tracee->pid, path_addr, path, PATH_MAX);
@@ -286,7 +285,39 @@ void handle_path_at(State *state, Tracee *tracee,
       return;
   }
 
-  watch_abs_path(state, full_path);
+  char resolved_path[PATH_MAX];
+  char *success = realpath(full_path, resolved_path);
+  if (!success)
+    return;
+
+  if (!should_watch_resolved_path(state, resolved_path, use_type))
+    return;
+
+  // TODO: Figure out the right mask.
+  U32 mask = 0;
+  mask |= IN_CLOSE_WRITE | IN_MOVED_TO;
+  if (state->watch_directories)
+    mask |= IN_CREATE | IN_DELETE;
+  //mask |= IN_MODIFY;
+  //mask |= IN_DELETE_SELF;
+
+  mask |= IN_MASK_CREATE;
+
+  int wd = inotify_add_watch(state->inotify_fd, resolved_path, mask);
+  if (wd < 0) {
+    if (errno == EEXIST) {
+      // We were already watching this file.
+    } else {
+      fprintf(stderr, "can't inotify_add [%s]: %s\n", resolved_path, strerror(errno));
+    }
+  } else {
+    if (state->verbose > 2) {
+      printf("mustardwatch: Watching (%d, tracee: %d) %s\n",
+             wd, tracee->pid, resolved_path);
+    } else if (state->verbose > 1) {
+      printf("mustardwatch: Watching (%d) %s\n", wd, resolved_path);
+    }
+  }
 }
 
 void handle_syscall(State *state, Tracee *tracee) {
@@ -306,28 +337,35 @@ void handle_syscall(State *state, Tracee *tracee) {
   switch (syscall_number) {
   Case __NR_open:
     // For open/openat: Skip files opened for writing, and directories.
-    if (cast(int) args[1] & (O_RDWR|O_WRONLY|O_DIRECTORY)) break;
-    handle_path_at(state, tracee, AT_FDCWD, args[0]);
+    if (cast(int) args[1] & (O_RDWR|O_WRONLY)) break;
+    if (!state->watch_directories && cast(int) args[1] & O_DIRECTORY) break;
+    handle_path_at(state, tracee, UseType_Open, AT_FDCWD, args[0]);
   Case __NR_openat:
-    if (cast(int) args[2] & (O_RDWR|O_WRONLY|O_DIRECTORY)) break;
-    handle_path_at(state, tracee, cast(int) args[0], args[1]);
-  Case __NR_stat: handle_path_at(state, tracee, AT_FDCWD, args[0]);
-  Case __NR_lstat: handle_path_at(state, tracee, AT_FDCWD, args[0]);
+    if (cast(int) args[2] & (O_RDWR|O_WRONLY)) break;
+    if (!state->watch_directories && cast(int) args[2] & O_DIRECTORY) break;
+    handle_path_at(state, tracee, UseType_Open, cast(int) args[0], args[1]);
+  Case __NR_stat:
+    handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
+  Case __NR_lstat:
+    handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
   Case __NR_newfstatat:
     // fstatat/statx might be used with AT_EMPTY_PATH and an empty path; we don't
     // care about watching fds so we'll just treat it as an empty string (and
     // ignore it).
-    handle_path_at(state, tracee, cast(int) args[0], args[1]);
-  Case __NR_statx: handle_path_at(state, tracee, cast(int) args[0], args[1]);
+    handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
+  Case __NR_statx:
+    handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
   Case __NR_access:
     // For access/faccessat: Skip files checked for writability.
     if (cast(int) args[1] & W_OK) break;
-    handle_path_at(state, tracee, AT_FDCWD, args[0]);
+    handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
   Case __NR_faccessat:
     if (cast(int) args[2] & W_OK) break;
-    handle_path_at(state, tracee, cast(int) args[0], args[1]);
-  Case __NR_readlink: handle_path_at(state, tracee, AT_FDCWD, args[0]);
-  Case __NR_readlinkat: handle_path_at(state, tracee, cast(int) args[0], args[1]);
+    handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
+  Case __NR_readlink:
+    handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
+  Case __NR_readlinkat:
+    handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
   }
 }
 
@@ -394,31 +432,6 @@ void setup_inotify(State *state) {
   if (state->inotify_fd < 0) die("inotify_init1 error");
 }
 
-bool should_watch_resolved_path(char *path) {
-  static char *ignored_prefixes[] = {
-    "/dev/", "/lib/", "/usr/", "/proc/", "/sys/", "/tmp/", "/etc/", "/bin/",
-  };
-
-  for (U32 i = 0; i < numof(ignored_prefixes); i++) {
-    if (string_starts_with(ignored_prefixes[i], path)) {
-      return false;
-    }
-  }
-
-  // Only watch regular files.
-  struct stat statbuf;
-  int res = stat(path, &statbuf);
-  if (res < 0) return false;
-  if (!S_ISREG(statbuf.st_mode)) return false;
-
-  // Could also ignore files owned by root or other heuristics.
-
-  // Maybe we should watch directories? Say for a command that builds *.c.
-  // But it seems tricky to do without a bunch of false positives.
-
-  return true;
-}
-
 void empty_sighandler(int signum) {
   (void) signum;
 }
@@ -436,17 +449,19 @@ Run a command, tracing it to detect files it uses (or might use), and watch\n\
 those files for changes. When a file changes, rerun the command.\n\
 \n\
 File events generated while the command is running are ignored, as are events\n\
-in common directories (like /usr/ and /dev/), and events on directories\n\
-themselves (only files are tracked).\n\
+in common directories (/bin, /dev, /etc, /lib, /proc, /sys, /tmp, /usr).\n\
 \n\
 Files used by subprocesses are also tracked (but note that all subprocesses\n\
 are killed when the main process exits).\n\n\
 Options:\n\
 ");
-
       MOP_OPT(.name = "clear", .short_name = 'c',
               .help = "clear screen before running program") {
         state.clear = true;
+      }
+      MOP_OPT(.name = "directories", .short_name = 'd',
+              .help = "watch directories as well as regular files") {
+        state.watch_directories = true;
       }
       MOP_OPT(.name = "verbose", .short_name = 'v',
               .help = "show verbose output (watched files and events)\n"
@@ -634,6 +649,23 @@ Options:\n\
         if (sig == SIGTRAP && wstatus >> 16) {
           // This is a ptrace event of some sort. Don't forward the SIGTRAP.
           // Is this really what you're supposed to do?
+
+          int ptrace_event = wstatus >> 16;
+          // Report tracee cmdlines as they exec.
+          // (cmdline is nul-terminated so only argv[0] should be printed.)
+          if (state.verbose > 2 && ptrace_event == PTRACE_EVENT_EXEC) {
+            char path[128];
+            snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
+            int fd = open(path, O_RDONLY);
+            if (fd >= 0) {
+              char buf[4096];
+              int n = read(fd, buf, sizeof buf);
+              if (n > 0) {
+                printf("mustardwatch: Tracee %d exec: %.*s\n", pid, n, buf);
+              }
+              close(fd);
+            }
+          }
         } else {
           // This looks like a real signal, so send it on.
           continue_signal = sig;
