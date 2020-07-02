@@ -3,7 +3,8 @@
 // those files for changes. When a file changes, rerun the command.
 
 // There are many things that access files that this program doesn't track.
-// For the most part it only looks for files opened for reading, checked with stat.
+// For the most part it only looks for files opened for reading, or checked with
+// stat.
 // It doesn't track:
 // * Files that exist at startup (like stdin)
 // * rename, chmod, unlink, mkdir, bind, mknod, etc.
@@ -40,8 +41,8 @@
 // TODO: If ptrace slows programs down a lot, it might be useful to have a mode
 // that detects files on the first run, and then remembers them, rather than
 // clearing out the inotify list on each run.
-// This might also be implemented as a pseudo-strace mode that runs a command
-// once and writes out a list of relevant files.
+// This might not be necessary, since you can use --out to write out a list of
+// relevant files, and then use some other tool to watch them for changes.
 
 
 #define _GNU_SOURCE 1
@@ -180,6 +181,8 @@ Struct(State) {
   int verbose;
   bool clear;
   bool watch_directories;
+  char *out_path;
+  FILE *out_file;
 
   int inotify_fd;
   int child_pid;
@@ -336,6 +339,10 @@ void handle_path_at(State *state, Tracee *tracee, UseType use_type,
       fprintf(stderr, "can't inotify_add [%s]: %s\n", resolved_path, strerror(errno));
     }
   } else {
+    if (state->out_file) {
+      fprintf(state->out_file, "%s\n", resolved_path);
+    }
+
     if (state->verbose > 2) {
       printf("mustardwatch: Watching (%d, tracee: %d) %s\n",
              wd, tracee->pid, resolved_path);
@@ -488,6 +495,12 @@ Options:\n\
               .help = "watch directories as well as regular files") {
         state.watch_directories = true;
       }
+      MOP_OPT(.name = "out", .short_name = 'o',
+              .help = "rather than respawning the process when files change, write\n"
+                      "  out a list of watched files to a file, then exit",
+              .has_arg = true, .optarg_name = "FILE") {
+        state.out_path = mop.optarg;
+      }
       MOP_OPT(.name = "verbose", .short_name = 'v',
               .help = "show verbose output (watched files and events)\n"
                       "  (use multiple times for more verbose output)") {
@@ -507,6 +520,14 @@ Options:\n\
     if (mop.argind == argc) {
       mop_print_usage(&mop, stderr);
       exit(1);
+    }
+
+    if (state.out_path) {
+      state.out_file = fopen(state.out_path, "w");
+      if (!state.out_file) {
+        fprintf(stderr, "could not open %s: %s", state.out_path, strerror(errno));
+        exit(1);
+      }
     }
 
     state.program_argv = argv + mop.argind;
@@ -637,6 +658,12 @@ Options:\n\
             printf("mustardwatch: Process exited\n");
           }
           state.tracees_len--;
+          if (state.out_file) {
+            // We were only writing out a list of watched files, so now that the
+            // process has exited, we're done.
+            fclose(state.out_file);
+            exit(0);
+          }
         } else {
           // A subprocess exited. Stop tracing it.
           if (state.verbose > 2) {
@@ -676,9 +703,9 @@ Options:\n\
           // Is this really what you're supposed to do?
 
           int ptrace_event = wstatus >> 16;
-          // Report tracee cmdlines as they exec.
-          // (cmdline is nul-terminated so only argv[0] should be printed.)
           if (state.verbose > 2 && ptrace_event == PTRACE_EVENT_EXEC) {
+            // Report tracee cmdlines as they exec.
+            // (cmdline is nul-terminated so only argv[0] should be printed.)
             char path[128];
             snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
             int fd = open(path, O_RDONLY);

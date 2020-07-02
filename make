@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-#cc=clang
-cc=tcc
+cc=clang
+#cc=tcc
 
 cflags=()
 cflags+=(-Wall -Wextra -g)
