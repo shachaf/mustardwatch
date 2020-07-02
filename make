@@ -3,12 +3,13 @@
 set -euo pipefail
 
 cc=clang
-#cc=tcc
 
 cflags=()
 cflags+=(-Wall -Wextra -g)
-#cflags+=(-O2 -DNDEBUG)
+cflags+=(-O2)
+
+mkdir -p build
 
 $cc \
-  -o mustardwatch mustardwatch.c \
+  -o build/mustardwatch mustardwatch.c \
   "${cflags[@]}"

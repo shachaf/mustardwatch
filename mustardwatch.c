@@ -68,7 +68,7 @@
 #include <unistd.h>
 
 #define MOP_IMPLEMENTATION 1
-#include "mop.h"
+#include "extern/mop.h"
 
 #define Struct(name) typedef struct name name; struct name
 #define Union(name) typedef union name name; union name
