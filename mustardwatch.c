@@ -436,45 +436,41 @@ void run_program(State *state) {
   pid_t child_pid = fork();
   if (child_pid < 0) die("fork error");
 
-  if (child_pid > 0) {
-    // Parent.
-    state->child_pid = child_pid;
-
-    int wstatus;
-    pid_t pid = waitpid(state->child_pid, &wstatus, __WALL);
-    if (pid < 0) die("waitpid");
-
-    if (WIFEXITED(wstatus) || WIFEXITED(wstatus)) {
-      // Exited before SIGSTOP, which probably means an execve error.
-      // Not much we can do here.
-      // The child probably printed out an error message already.
-      if (state->verbose > 1) print_wstatus(pid, wstatus);
-      fprintf(stderr, "mustardwatch: Exiting\n");
-      exit(1);
-    }
-
-    U64 flags = 0;
-    flags |= PTRACE_O_TRACECLONE;
-    flags |= PTRACE_O_TRACEFORK;
-    flags |= PTRACE_O_TRACEVFORK;
-    flags |= PTRACE_O_TRACEEXEC;
-    flags |= PTRACE_O_TRACESYSGOOD;
-    long res = ptrace(PTRACE_SETOPTIONS, state->child_pid, 0, flags);
-    if (res < 0) die("ptrace (SETOPTIONS) error");
-
-    // Wait for next system call.
-    res = ptrace(PTRACE_SYSCALL, state->child_pid, 0, 0);
-    if (res < 0) die("ptrace (SYSCALL) error");
-
-    return;
+  if (child_pid == 0) {
+    // Child.
+    long res = ptrace(PTRACE_TRACEME, 0, 0, 0);
+    if (res < 0) die("ptrace (TRACEME) error");
+    execvp(state->program_argv[0], state->program_argv);
+    die("exec error");
   }
 
-  // Child.
-  long res = ptrace(PTRACE_TRACEME, 0, 0, 0);
-  if (res < 0) die("ptrace (TRACEME) error");
-  // Child.
-  execvp(state->program_argv[0], state->program_argv);
-  die("exec error");
+  // Parent.
+  state->child_pid = child_pid;
+
+  int wstatus;
+  pid_t pid = waitpid(state->child_pid, &wstatus, __WALL);
+  if (pid < 0) die("waitpid");
+
+  if (WIFEXITED(wstatus) || WIFEXITED(wstatus)) {
+    // Exited before SIGSTOP, which probably means an execve error.
+    // Not much we can do here.
+    // The child probably printed out an error message already.
+    if (state->verbose > 1) print_wstatus(pid, wstatus);
+    fprintf(stderr, "mustardwatch: Exiting\n");
+    exit(1);
+  }
+
+  U64 flags = 0;
+  flags |= PTRACE_O_TRACECLONE|PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK;
+  flags |= PTRACE_O_TRACEEXEC;
+  flags |= PTRACE_O_TRACESYSGOOD;
+  //flags |= PTRACE_O_EXITKILL; // ?
+  long res = ptrace(PTRACE_SETOPTIONS, state->child_pid, 0, flags);
+  if (res < 0) die("ptrace (SETOPTIONS) error");
+
+  // Wait for next system call.
+  res = ptrace(PTRACE_SYSCALL, state->child_pid, 0, 0);
+  if (res < 0) die("ptrace (SYSCALL) error");
 }
 
 void setup_inotify(State *state) {
