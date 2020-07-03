@@ -181,6 +181,7 @@ Struct(State) {
   int verbose;
   bool clear;
   bool watch_directories;
+  bool watch_common_directories;
   char *out_path;
   FILE *out_file;
 
@@ -263,12 +264,14 @@ bool should_watch_resolved_path(State *state, char *path, UseType use_type) {
     "/bin", "/dev", "/etc", "/lib", "/proc", "/sys", "/tmp", "/usr",
   };
 
-  for (U32 i = 0; i < numof(ignored_prefixes); i++) {
-    char *prefix = ignored_prefixes[i];
-    size_t prefix_len = strlen(prefix);
-    if (strncmp(prefix, path, prefix_len) == 0) {
-      if (path[prefix_len] == '\0' || path[prefix_len] == '/')
-        return false;
+  if (!state->watch_common_directories) {
+    for (U32 i = 0; i < numof(ignored_prefixes); i++) {
+      char *prefix = ignored_prefixes[i];
+      size_t prefix_len = strlen(prefix);
+      if (strncmp(prefix, path, prefix_len) == 0) {
+        if (path[prefix_len] == '\0' || path[prefix_len] == '/')
+          return false;
+      }
     }
   }
 
@@ -480,8 +483,9 @@ Usage: mustardwatch [OPTION...] COMMAND [ARG...]\n\
 Run a command, tracing it to detect files it uses (or might use), and watch\n\
 those files for changes. When a file changes, rerun the command.\n\
 \n\
-File events generated while the command is running are ignored, as are events\n\
-in common directories (/bin, /dev, /etc, /lib, /proc, /sys, /tmp, /usr).\n\
+File events generated while the command is running are ignored. Files in\n\
+common global directories (/bin, /dev, /etc, /lib, /proc, /sys, /tmp, /usr)\n\
+are skipped by default.\n\
 \n\
 Files used by subprocesses are also tracked (but note that all subprocesses\n\
 are killed when the main process exits).\n\n\
@@ -495,9 +499,13 @@ Options:\n\
               .help = "watch directories as well as regular files") {
         state.watch_directories = true;
       }
+      MOP_OPT(.name = "global", .short_name = 'g',
+              .help = "do not skip files in common global directories") {
+        state.watch_common_directories = true;
+      }
       MOP_OPT(.name = "out", .short_name = 'o',
-              .help = "rather than respawning the process when files change, write\n"
-                      "  out a list of watched files to a file, then exit",
+              .help = "rather than respawning the process when files change,\n"
+                      "  write out a list of watched files to FILE, then exit",
               .has_arg = true, .optarg_name = "FILE") {
         state.out_path = mop.optarg;
       }
