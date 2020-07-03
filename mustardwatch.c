@@ -83,6 +83,9 @@
 
 #define numof(a) (sizeof (a) / sizeof (*(a)))
 
+#define ALIGNED_AS(type) __attribute__((aligned(__alignof__ (type))))
+#define NORETURN __attribute__((noreturn))
+
 typedef uint8_t  U8;
 typedef uint16_t U16;
 typedef uint32_t U32;
@@ -159,6 +162,7 @@ void print_inotify_event(struct inotify_event *event) {
   printf("\n");
 }
 
+NORETURN
 void die(const char *msg) {
   fprintf(stderr, "%s: %s\n", msg, strerror(errno));
   exit(1);
@@ -406,7 +410,7 @@ void handle_syscall(State *state, Tracee *tracee) {
 
 void run_program(State *state) {
   if (state->clear) {
-    printf("\e[H\e[2J\e[3J");
+    printf("\033[H\033[2J\033[3J");
     fflush(stdout);
   }
 
@@ -558,12 +562,12 @@ Options:\n\
 
   while (1) {
     struct pollfd pfd = {.fd = state.inotify_fd, .events = POLLIN};
-    int r = ppoll(&pfd, 1, 0, &orig_sigset);
+    r = ppoll(&pfd, 1, 0, &orig_sigset);
     if (r < 0 && errno != EINTR) die("ppoll");
 
     // See if we got any file event notifications.
     if (pfd.revents) {
-      char buf[4096];
+      char buf[4096] ALIGNED_AS(struct inotify_event);
       while (1) {
         ssize_t n = read(state.inotify_fd, buf, sizeof buf);
         if (n < 0) {
@@ -651,13 +655,13 @@ Options:\n\
             // It would possibly be nice to just detach from subprocesses
             // instead of killing, but apparently strace makes that kind of
             // complicated.
-            pid_t pid = state.tracees[state.tracees_len - 1].pid;
-            printf("mustardwatch: Killing subprocess %d\n", pid);
+            pid_t subprocess_pid = state.tracees[state.tracees_len - 1].pid;
+            printf("mustardwatch: Killing subprocess %d\n", subprocess_pid);
 
-            kill(pid, SIGKILL);
+            kill(subprocess_pid, SIGKILL);
 
-            int wstatus;
-            pid_t p = waitpid(pid, &wstatus, __WALL);
+            int subprocess_wstatus;
+            pid_t p = waitpid(subprocess_pid, &subprocess_wstatus, __WALL);
             if (p < 0) die("could not waitpid after killing subprocess");
 
             state.tracees_len--;
