@@ -38,6 +38,14 @@
 // It might be good to make these more configurable, or to tweak them.
 // There might also be other good heuristics, like skipping files owned by root.
 
+// TODO: If a tracee tries to open a file that doesn't exist, we could watch its
+// parent directory (or the first ancestor that exists). This is slightly tricky
+// to do correctly -- better symlink handling should probably come first.
+//
+// It could also mean watching a lot of extraneous directories, because programs
+// expect stat to be a cheap way to check if a file exists. E.g. this would
+// watch every directory in $PATH as a shell searches for an executable.
+
 // TODO: If ptrace slows programs down a lot, it might be useful to have a mode
 // that detects files on the first run, and then remembers them, rather than
 // clearing out the inotify list on each run.
@@ -319,6 +327,9 @@ void handle_path_at(State *state, Tracee *tracee, UseType use_type,
     if (n >= cast(int) sizeof full_path)
       return;
   }
+
+  // It may be a good idea to exit before calling realpath() in some cases, if
+  // we know we would skip the file anyway.
 
   char resolved_path[PATH_MAX];
   char *success = realpath(full_path, resolved_path);
