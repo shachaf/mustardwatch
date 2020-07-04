@@ -69,6 +69,7 @@
 #include <syscall.h>
 #include <sys/inotify.h>
 #include <sys/ptrace.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/user.h>
@@ -201,6 +202,7 @@ Struct(State) {
   FILE *out_file;
 
   int inotify_fd;
+  int signal_fd;
   int child_pid;
   Tracee tracees[MAX_TRACEES];
   int tracees_len;
@@ -527,6 +529,20 @@ void empty_sighandler(int signum) {
   (void) signum;
 }
 
+// Read from a non-blocking file descriptor until EAGAIN, without caring about
+// the contents.
+void drain_fd(int fd) {
+  char buf[4096];
+  while (1) {
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n < 0) {
+      if (errno == EAGAIN)
+        break;
+      die("drain_fd");
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   State state = {0};
 
@@ -598,27 +614,28 @@ Options:\n\
   }
 
   // Set up a blocked signal handler for SIGCHLD.
-  sigset_t orig_sigset;
-  sigset_t block_sigchld;
-  sigemptyset(&block_sigchld);
-  sigaddset(&block_sigchld, SIGCHLD);
-  int r = sigprocmask(SIG_BLOCK, &block_sigchld, &orig_sigset);
+  sigset_t sigchld_mask;
+  sigemptyset(&sigchld_mask);
+  sigaddset(&sigchld_mask, SIGCHLD);
+  int r = sigprocmask(SIG_BLOCK, &sigchld_mask, 0);
   if (r < 0) die("sigprocmask");
 
-  struct sigaction action = {.sa_handler = empty_sighandler};
-  r = sigaction(SIGCHLD, &action, 0);
-  if (r < 0) die("sigaction");
+  state.signal_fd = signalfd(-1, &sigchld_mask, SFD_CLOEXEC|SFD_NONBLOCK);
+  if (state.signal_fd < 0) die("signalfd");
 
   setup_inotify(&state);
   run_program(&state);
 
   while (1) {
-    struct pollfd pfd = {.fd = state.inotify_fd, .events = POLLIN};
-    r = ppoll(&pfd, 1, 0, &orig_sigset);
+    struct pollfd pfds[] = {
+      [0] = {.fd = state.inotify_fd, .events = POLLIN},
+      [1] = {.fd = state.signal_fd, .events = POLLIN},
+    };
+    r = ppoll(pfds, numof(pfds), 0, 0);
     if (r < 0 && errno != EINTR) die("ppoll");
 
     // See if we got any file event notifications.
-    if (pfd.revents) {
+    if (pfds[0].revents) {
       char buf[4096] ALIGNED_AS(struct inotify_event);
       while (1) {
         ssize_t n = read(state.inotify_fd, buf, sizeof buf);
@@ -653,7 +670,12 @@ Options:\n\
       }
     }
 
-    // See if any child events happened.
+    // See if any child events happened. We get the information we need from wait,
+    // not signalfd -- we only use the fd to wake up when something happens.
+    if (pfds[1].revents) {
+      drain_fd(state.signal_fd);
+    }
+
     while (1) {
       int wstatus;
       pid_t pid = waitpid(-1, &wstatus, WNOHANG|__WALL);
