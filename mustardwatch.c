@@ -180,9 +180,6 @@ void die(const char *msg) {
 enum { MAX_TRACEES = 128 };
 
 Enum(TraceeState) {
-  // Waiting for initial SIGSTOP from a new cloned tracee.
-  TraceeState_InitialStop,
-
   TraceeState_InSyscall,
   TraceeState_NotInSyscall,
 };
@@ -479,9 +476,9 @@ void run_program(State *state) {
   if (child_pid < 0) die("fork error");
 
   if (child_pid == 0) {
-    // Child.
-    long res = ptrace(PTRACE_TRACEME, 0, 0, 0);
-    if (res < 0) die("ptrace (TRACEME) error");
+    // Child. Stop ourselves to let the parent trace us.
+    int r = kill(getpid(), SIGSTOP);
+    if (r < 0) die("kill($$, SIGSTOP)");
 
     execvp(state->program_argv[0], state->program_argv);
     die("exec error");
@@ -491,17 +488,10 @@ void run_program(State *state) {
   state->child_pid = child_pid;
 
   int wstatus;
-  pid_t pid = waitpid(state->child_pid, &wstatus, __WALL);
-  if (pid < 0) die("waitpid");
-
-  if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
-    // Exited before SIGSTOP, which probably means an execve error.
-    // Not much we can do here.
-    // The child probably printed out an error message already.
-    if (state->verbose > 1) print_wstatus(pid, wstatus);
-    fprintf(stderr, "mustardwatch: Exiting\n");
-    exit(1);
-  }
+  pid_t p = waitpid(state->child_pid, &wstatus, WSTOPPED);
+  if (p < 0) die("waitpid for SIGSTOP");
+  assert(p == state->child_pid);
+  assert(WIFSTOPPED(wstatus));
 
   U64 flags = 0;
   flags |= PTRACE_O_TRACECLONE|PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK;
@@ -510,23 +500,20 @@ void run_program(State *state) {
   flags |= PTRACE_O_TRACESYSGOOD;
   flags |= PTRACE_O_EXITKILL;
 
-  long res = ptrace(PTRACE_SETOPTIONS, state->child_pid, 0, flags);
-  if (res < 0) die("ptrace (SETOPTIONS) error");
+  // Seize the child. This doesn't stop it (but it's already stopped).
+  long res = ptrace(PTRACE_SEIZE, state->child_pid, 0, flags);
+  if (res < 0) die("ptrace (SEIZE) error");
 
   add_tracee(state, state->child_pid, TraceeState_NotInSyscall);
 
-  // Wait for next system call.
-  res = ptrace(PTRACE_SYSCALL, state->child_pid, 0, 0);
-  if (res < 0) die("ptrace (SYSCALL) error");
+  // Send the child a SIGCONT to resume execution.
+  int r = kill(state->child_pid, SIGCONT);
+  if (r < 0) die("kill(child, CONT)");
 }
 
 void setup_inotify(State *state) {
   state->inotify_fd = inotify_init1(IN_CLOEXEC|IN_NONBLOCK);
   if (state->inotify_fd < 0) die("inotify_init1 error");
-}
-
-void empty_sighandler(int signum) {
-  (void) signum;
 }
 
 // Read from a non-blocking file descriptor until EAGAIN, without caring about
@@ -699,7 +686,7 @@ Options:\n\
         // We don't know this tracee, which means the child cloned.
         // Sometimes we see a new tracee via waitpid before we see get the
         // PTRACE_EVENT_CLONE, so we just treat any unknown pid as a new child.
-        tracee_index = add_tracee(&state, pid, TraceeState_InitialStop);
+        tracee_index = add_tracee(&state, pid, TraceeState_NotInSyscall);
       }
 
       Tracee *tracee = &state.tracees[tracee_index];
@@ -750,18 +737,24 @@ Options:\n\
       // Signal to pass on to the tracee, if any.
       int continue_signal = 0;
 
+      bool continue_with_listen = false;
+
       // The tracee stopped. This can be for several reasons:
       // * Syscall-stop (the tracee is about to enter or just exited a syscall)
-      // * PTRACE_EVENT stop (we got a PTRACE_EVENT like fork)
-      // * Signal-delivery-stop (the tracee got a signal which we're intercepting)
+      // * PTRACE_EVENT stop (we got a PTRACE_EVENT like FORK)
       // * Group-stop (non-signal stops sent to all threads)
-      // * SIGSTOP indicating a new tracee (delivered right after fork)
+      // * Signal-delivery-stop (the tracee got a signal which we're intercepting)
 
-      // See the ptrace manual section on group-stops; it seems that there's no
-      // way to handle things like SIGTSTP/SIGCONT correctly.
+      // The situation with group-stop is this:
+      // When a tracee gets e.g. a SIGSTOP, it gets a signal-delivery-stop (on
+      // one thread), which we treat as normal (just pass the signal on).
+      // After we forward the signal, we get a "group-stop": Every thread is
+      // stopped, and is put in a special stopped state. We want the tracee
+      // to be in a regular stopped state, so instead of resuming as normal
+      // (which would continue a tracee that's supposed to be stopped), we use
+      // PTRACE_LISTEN, which puts it in a regular stopped state.
 
-      bool is_syscall_trap = sig == (SIGTRAP|0x80);
-      if (is_syscall_trap) {
+      if (sig == (SIGTRAP|0x80)) {
         // This was a syscall SIGTRAP (TRACESYSGOOD), i.e. we're about to enter
         // or have just exited a syscall.
 
@@ -772,10 +765,8 @@ Options:\n\
           handle_syscall(&state, tracee);
         Case TraceeState_InSyscall:
           tracee->state = TraceeState_NotInSyscall;
-        Case TraceeState_InitialStop:
-          assert(!"invalid syscall SIGTRAP?");
         }
-      } else if (sig == SIGTRAP && wstatus >> 16) {
+      } else if (wstatus >> 16) {
         // The tracee stopped with a ptrace event. This is only indicating an
         // event to the tracer; don't forward the signal.
 
@@ -786,6 +777,22 @@ Options:\n\
           // We can request the new tracee PID here, but is there a point?
           // We're not guaranteed to see this event before seeing the pid via
           // wait, so we have to handle unknown pids anyway.
+        }
+
+        if (event == PTRACE_EVENT_STOP) {
+          if (sig == SIGTRAP) {
+            // SIGTRAP PTRACE_EVENT_STOP means we successfully attached to or
+            // interrupted a tracee.
+          } else {
+            // This is a group-stop, which means the tracee is in a weird
+            // ptrace-only stopped state. We want to take it to a regular
+            // stopped state, but not to restart it, so we use PTRACE_LISTEN.
+            assert(sig == SIGSTOP ||
+                   sig == SIGTSTP ||
+                   sig == SIGTTIN ||
+                   sig == SIGTTOU);
+            continue_with_listen = true;
+          }
         }
 
         if (state.verbose > 2 && event == PTRACE_EVENT_EXEC) {
@@ -803,40 +810,23 @@ Options:\n\
             close(fd);
           }
         }
-      } else if (sig == SIGSTOP && tracee->state == TraceeState_InitialStop) {
-        // This is the initial SIGSTOP of a forked process. It's not a real signal,
-        // so don't forward it.
-        tracee->state = TraceeState_NotInSyscall;
       } else {
-        // This is either a signal-delivery-stop or a group-stop.
-        //
-        // We can tell it's a group-stop if we get a stopping signal from
-        // wait, and then get EINVAL from PTRACE_GETSIGINFO.
-
-        // ...But actually we treat the two kinds of stops the same anyway,
-        // so this doesn't matter.
-
-        //if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
-        //  siginfo_t siginfo;
-        //  long res = ptrace(PTRACE_GETSIGINFO, pid, 0, &siginfo);
-        //  if (res < 0) {
-        //    if (errno != EINVAL)
-        //      die("ptrace (GETSIGINFO) error");
-        //    // This is a group-stop.
-        //  } else {
-        //    // This is a signal-delivery-stop.
-        //  }
-        //} else {
-        //  // This is a signal-delivery-stop by default.
-        //}
-
+        // This is a signal-delivery-stop. Pass the signal on to the tracee.
         continue_signal = sig;
       }
 
-      long res = ptrace(PTRACE_SYSCALL, tracee->pid, 0, continue_signal);
-      if (res < 0) {
-        fprintf(stderr, "ptrace (SYSCALL) (%d): %s\n", tracee->pid, strerror(errno));
-        exit(1);
+      if (continue_with_listen) {
+        long res = ptrace(PTRACE_LISTEN, tracee->pid, 0, 0);
+        if (res < 0) {
+          fprintf(stderr, "ptrace (LISTEN) (%d): %s\n", tracee->pid, strerror(errno));
+          exit(1);
+        }
+      } else {
+        long res = ptrace(PTRACE_SYSCALL, tracee->pid, 0, continue_signal);
+        if (res < 0) {
+          fprintf(stderr, "ptrace (SYSCALL) (%d): %s\n", tracee->pid, strerror(errno));
+          exit(1);
+        }
       }
     }
   }
