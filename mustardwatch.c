@@ -322,6 +322,10 @@ void tracee_continue_normal_execution(Tracee *tracee, TraceeEvent ev) {
 
   long res = ptrace(req, tracee->pid, 0, continue_signal);
   if (res < 0) {
+    if (errno == ESRCH) {
+      // Tracee died unexpectedly.
+      return;
+    }
     fprintf(stderr, "continue tracee execution (%d): %s\n",
                     tracee->pid, strerror(errno));
     exit(1);
@@ -515,7 +519,13 @@ void handle_syscall(State *state, Tracee *tracee) {
 
   struct user_regs_struct regs;
   long res = ptrace(PTRACE_GETREGS, tracee->pid, 0, &regs);
-  if (res < 0) die("ptrace error (GETREGS)");
+  if (res < 0) {
+    if (errno == ESRCH) {
+      // Tracee died unexpectedly.
+      return;
+    }
+    die("ptrace error (GETREGS)");
+  }
 
   U64 syscall_number = regs.orig_rax;
   U64 args[6] = {regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9};
