@@ -177,17 +177,37 @@ void die(const char *msg) {
   exit(1);
 }
 
-enum { MAX_TRACEES = 128 };
+Enum(TraceeEventType) {
+  TraceeEvent_Exited,        // Exited with exit
+  TraceeEvent_Exited_Signal, // Died with a signal
+
+  TraceeEvent_Syscall,       // Right before or right after a system call
+  TraceeEvent_GroupStopped,  // Stopped due to stopping signal; see below
+  TraceeEvent_Interrupted,   // Interrupted for various reasons
+  TraceeEvent_GotSignal,     // Got a signal
+  TraceeEvent_MadeChild,     // Forked, etc. (event delivered on the parent)
+  TraceeEvent_Exec,          // About to exec
+};
+
+Struct(TraceeEvent) {
+  TraceeEventType type;
+  union {
+    int signal;    // _Exited_Signal, _GotSignal
+    int exit_code; // _Exited
+  };
+};
 
 Enum(TraceeState) {
+  TraceeState_Running,
   TraceeState_InSyscall,
-  TraceeState_NotInSyscall,
 };
 
 Struct(Tracee) {
   TraceeState state;
   pid_t pid;
 };
+
+enum { MAX_TRACEES = 128 };
 
 Struct(State) {
   char **program_argv;
@@ -204,6 +224,110 @@ Struct(State) {
   Tracee tracees[MAX_TRACEES];
   int tracees_len;
 };
+
+
+// Translate an event from the labyrinth of ptrace-related waitpid() statuses
+// into a more reasonable form.
+TraceeEvent translate_ptrace_event(int wstatus) {
+  // The tracee might have exited, either due to exit() or due to a signal.
+  if (WIFEXITED(wstatus)) {
+    return (TraceeEvent){.type = TraceeEvent_Exited,
+                         .signal = WEXITSTATUS(wstatus)};
+  }
+  if (WIFSIGNALED(wstatus)) {
+    return (TraceeEvent){.type = TraceeEvent_Exited_Signal,
+                         .signal = WTERMSIG(wstatus)};
+  }
+
+  assert(WIFSTOPPED(wstatus));
+
+  // The tracee stopped. This can be for several reasons:
+  // * Syscall-stop (the tracee is about to enter or just exited a syscall)
+  // * PTRACE_EVENT stop (we got a PTRACE_EVENT like FORK)
+  // * Group-stop (non-signal stops sent to all threads)
+  // * Signal-delivery-stop (the tracee got a signal which we're intercepting)
+
+  // The situation with group-stop is this:
+  // When a tracee gets e.g. a SIGSTOP, it gets a signal-delivery-stop (on one
+  // thread), which we treat like any signal (just pass the signal on). After
+  // we forward the signal, we get a "group-stop": Every thread is stopped, and
+  // is put in a special stopped state. We want the tracee to be in a regular
+  // stopped state, so instead of resuming as normal (which would continue a
+  // tracee that's supposed to be stopped), we use PTRACE_LISTEN, which puts it
+  // in a regular stopped state.
+
+  int sig = WSTOPSIG(wstatus);
+  int event = wstatus >> 16;
+
+  switch (event) {
+  Case 0:
+    if (sig == (SIGTRAP|0x80)) {
+      // Syscall-stop (reported with TRACESYSGOOD).
+      return (TraceeEvent){.type = TraceeEvent_Syscall};
+    } else {
+      // Signal-delivery-stop.
+      return (TraceeEvent){.type = TraceeEvent_GotSignal, .signal = sig};
+    }
+  Case PTRACE_EVENT_FORK: OrCase PTRACE_EVENT_VFORK: OrCase PTRACE_EVENT_CLONE:
+    return (TraceeEvent){.type = TraceeEvent_MadeChild};
+  Case PTRACE_EVENT_EXEC:
+    return (TraceeEvent){.type = TraceeEvent_Exec};
+  Case PTRACE_EVENT_STOP:
+    if (sig == SIGTRAP) {
+      // SIGTRAP PTRACE_EVENT_STOP. The tracee stopped for various reasons:
+      // We called INTERRUPT; this is a newly-forked child; child is resuming
+      // execution after a SIGCONT?
+      return (TraceeEvent){.type = TraceeEvent_Interrupted};
+    } else {
+      // Group-stop.
+      assert(sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU);
+      return (TraceeEvent){.type = TraceeEvent_GroupStopped, .signal = sig};
+    }
+  }
+
+  fprintf(stderr, "unknown ptrace event!");
+  exit(1);
+}
+
+// Continue normal execution after getting an event.
+void tracee_continue_normal_execution(Tracee *tracee, TraceeEvent ev) {
+  enum __ptrace_request req = PTRACE_SYSCALL;
+  int continue_signal = 0;
+
+  switch (ev.type) {
+  Case TraceeEvent_Exited: OrCase TraceeEvent_Exited_Signal:
+    return;
+
+  Case TraceeEvent_Syscall:
+    switch (tracee->state) {
+    Case TraceeState_Running: tracee->state = TraceeState_InSyscall;
+    Case TraceeState_InSyscall: tracee->state = TraceeState_Running;
+    }
+
+  Case TraceeEvent_Interrupted:
+  OrCase TraceeEvent_MadeChild:
+  OrCase TraceeEvent_Exec:
+    {}
+
+  Case TraceeEvent_GotSignal:
+    // Forward a signal to the tracee.
+    continue_signal = ev.signal;
+  Case TraceeEvent_GroupStopped:
+    // The tracee is group-stopped (due to a stopping signal like SIGSTOP),
+    // which is a special ptrace-only stopped state. It's supposed to be
+    // stopped, so we don't want to restart execution, but we do want it to be
+    // in a regular non-ptrace stopped state, so we use PTRACE_LISTEN.
+    req = PTRACE_LISTEN;
+  }
+
+  long res = ptrace(req, tracee->pid, 0, continue_signal);
+  if (res < 0) {
+    fprintf(stderr, "continue tracee execution (%d): %s\n",
+                    tracee->pid, strerror(errno));
+    exit(1);
+  }
+}
+
 
 // How does a program use a file?
 Enum(UseType) {
@@ -382,7 +506,7 @@ void handle_syscall(State *state, Tracee *tracee) {
   //                  sizeof syscall_info, &syscall_info);
   //if (res < 0) die("ptrace error (GET_SYSCALL_INFO)");
   //assert(syscall_info.op == PTRACE_SYSCALL_INFO_ENTRY);
-  //
+
   //U64 syscall_number = syscall_info.entry.nr;
   //U64 args[6] = {syscall_info.entry.args[0], syscall_info.entry.args[1],
   //               syscall_info.entry.args[2], syscall_info.entry.args[3],
@@ -422,12 +546,15 @@ void handle_syscall(State *state, Tracee *tracee) {
     if (cast(int) args[1] & W_OK) break;
     handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
   Case __NR_faccessat:
+    // Note: The system call doesn't take a flags argument.
     if (cast(int) args[2] & W_OK) break;
     handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
   Case __NR_readlink:
     handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
   Case __NR_readlinkat:
     handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
+  //Case __NR_faccessat2:
+  //Case __NR_readfile:
   }
 }
 
@@ -496,7 +623,6 @@ void run_program(State *state) {
   U64 flags = 0;
   flags |= PTRACE_O_TRACECLONE|PTRACE_O_TRACEFORK|PTRACE_O_TRACEVFORK;
   flags |= PTRACE_O_TRACEEXEC;
-  flags |= PTRACE_O_TRACEEXIT;
   flags |= PTRACE_O_TRACESYSGOOD;
   flags |= PTRACE_O_EXITKILL;
 
@@ -504,7 +630,11 @@ void run_program(State *state) {
   long res = ptrace(PTRACE_SEIZE, state->child_pid, 0, flags);
   if (res < 0) die("ptrace (SEIZE) error");
 
-  add_tracee(state, state->child_pid, TraceeState_NotInSyscall);
+  add_tracee(state, state->child_pid, TraceeState_Running);
+
+  // This may not be necessary, since the child is already stopped?
+  res = ptrace(PTRACE_INTERRUPT, state->child_pid, 0, 0);
+  if (res < 0) die("ptrace (INTERRUPT) error");
 
   // Send the child a SIGCONT to resume execution.
   int r = kill(state->child_pid, SIGCONT);
@@ -676,23 +806,26 @@ Options:\n\
 
       if (pid == 0) break;
 
-      if (state.verbose > 3) {
+      TraceeEvent ev = translate_ptrace_event(wstatus);
+
+      if (state.verbose > 4 ||
+          (state.verbose > 3 && ev.type != TraceeEvent_Syscall)) {
         printf("mustardwatch: ");
         print_wstatus(pid, wstatus);
       }
 
       int tracee_index = find_tracee(&state, pid);
       if (tracee_index == -1) {
-        // We don't know this tracee, which means the child cloned.
+        // We don't know this tracee, which means an existing tracee cloned.
         // Sometimes we see a new tracee via waitpid before we see get the
-        // PTRACE_EVENT_CLONE, so we just treat any unknown pid as a new child.
-        tracee_index = add_tracee(&state, pid, TraceeState_NotInSyscall);
+        // ptrace event, so we just treat any unknown pid as a new child.
+        tracee_index = add_tracee(&state, pid, TraceeState_Running);
       }
 
       Tracee *tracee = &state.tracees[tracee_index];
 
-      bool terminated = WIFEXITED(wstatus) || WIFSIGNALED(wstatus);
-      if (terminated) {
+      switch (ev.type) {
+      Case TraceeEvent_Exited: OrCase TraceeEvent_Exited_Signal:
         if (tracee_index == 0) {
           // If the main process exited, kill all other processes.
           while (state.tracees_len > 1) {
@@ -704,9 +837,13 @@ Options:\n\
 
             kill(subprocess_pid, SIGKILL);
 
-            int subprocess_wstatus;
-            pid_t p = waitpid(subprocess_pid, &subprocess_wstatus, __WALL);
-            if (p < 0) die("could not waitpid after killing subprocess");
+            while (1) {
+              int subprocess_wstatus;
+              pid_t p = waitpid(subprocess_pid, &subprocess_wstatus, __WALL);
+              if (p < 0) die("could not waitpid after killing subprocess");
+              if (WIFEXITED(subprocess_wstatus) || WIFSIGNALED(subprocess_wstatus))
+                break;
+            }
 
             state.tracees_len--;
           }
@@ -728,74 +865,22 @@ Options:\n\
           state.tracees[tracee_index] = state.tracees[state.tracees_len - 1];
           state.tracees_len--;
         }
-        continue;
-      }
-
-      assert(WIFSTOPPED(wstatus));
-      int sig = WSTOPSIG(wstatus);
-
-      // Signal to pass on to the tracee, if any.
-      int continue_signal = 0;
-
-      bool continue_with_listen = false;
-
-      // The tracee stopped. This can be for several reasons:
-      // * Syscall-stop (the tracee is about to enter or just exited a syscall)
-      // * PTRACE_EVENT stop (we got a PTRACE_EVENT like FORK)
-      // * Group-stop (non-signal stops sent to all threads)
-      // * Signal-delivery-stop (the tracee got a signal which we're intercepting)
-
-      // The situation with group-stop is this:
-      // When a tracee gets e.g. a SIGSTOP, it gets a signal-delivery-stop (on
-      // one thread), which we treat as normal (just pass the signal on).
-      // After we forward the signal, we get a "group-stop": Every thread is
-      // stopped, and is put in a special stopped state. We want the tracee
-      // to be in a regular stopped state, so instead of resuming as normal
-      // (which would continue a tracee that's supposed to be stopped), we use
-      // PTRACE_LISTEN, which puts it in a regular stopped state.
-
-      if (sig == (SIGTRAP|0x80)) {
-        // This was a syscall SIGTRAP (TRACESYSGOOD), i.e. we're about to enter
-        // or have just exited a syscall.
-
-        switch (tracee->state) {
-        Case TraceeState_NotInSyscall:
-          // This is the entry to a syscall.
-          tracee->state = TraceeState_InSyscall;
+      Case TraceeEvent_Syscall:
+        if (tracee->state == TraceeState_Running) {
+          // This is right before a syscall.
           handle_syscall(&state, tracee);
-        Case TraceeState_InSyscall:
-          tracee->state = TraceeState_NotInSyscall;
-        }
-      } else if (wstatus >> 16) {
-        // The tracee stopped with a ptrace event. This is only indicating an
-        // event to the tracer; don't forward the signal.
-
-        int event = wstatus >> 16;
-        if (event == PTRACE_EVENT_FORK ||
-            event == PTRACE_EVENT_VFORK ||
-            event == PTRACE_EVENT_CLONE) {
-          // We can request the new tracee PID here, but is there a point?
-          // We're not guaranteed to see this event before seeing the pid via
-          // wait, so we have to handle unknown pids anyway.
         }
 
-        if (event == PTRACE_EVENT_STOP) {
-          if (sig == SIGTRAP) {
-            // SIGTRAP PTRACE_EVENT_STOP means we successfully attached to or
-            // interrupted a tracee.
-          } else {
-            // This is a group-stop, which means the tracee is in a weird
-            // ptrace-only stopped state. We want to take it to a regular
-            // stopped state, but not to restart it, so we use PTRACE_LISTEN.
-            assert(sig == SIGSTOP ||
-                   sig == SIGTSTP ||
-                   sig == SIGTTIN ||
-                   sig == SIGTTOU);
-            continue_with_listen = true;
-          }
-        }
-
-        if (state.verbose > 2 && event == PTRACE_EVENT_EXEC) {
+      Case TraceeEvent_Interrupted: {}
+      Case TraceeEvent_GroupStopped: {}
+      Case TraceeEvent_GotSignal: {}
+      Case TraceeEvent_MadeChild: {
+        // We can request the new tracee PID here, but is there a point?
+        // We're not guaranteed to see this event before seeing the pid via
+        // wait, so we have to handle unknown pids anyway.
+      }
+      Case TraceeEvent_Exec:
+        if (state.verbose > 2) {
           // Report tracee cmdlines as they exec.
           // (cmdline is nul-terminated so only argv[0] should be printed.)
           char path[128];
@@ -810,24 +895,9 @@ Options:\n\
             close(fd);
           }
         }
-      } else {
-        // This is a signal-delivery-stop. Pass the signal on to the tracee.
-        continue_signal = sig;
       }
 
-      if (continue_with_listen) {
-        long res = ptrace(PTRACE_LISTEN, tracee->pid, 0, 0);
-        if (res < 0) {
-          fprintf(stderr, "ptrace (LISTEN) (%d): %s\n", tracee->pid, strerror(errno));
-          exit(1);
-        }
-      } else {
-        long res = ptrace(PTRACE_SYSCALL, tracee->pid, 0, continue_signal);
-        if (res < 0) {
-          fprintf(stderr, "ptrace (SYSCALL) (%d): %s\n", tracee->pid, strerror(errno));
-          exit(1);
-        }
-      }
+      tracee_continue_normal_execution(tracee, ev);
     }
   }
 
