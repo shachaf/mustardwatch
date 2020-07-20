@@ -4,7 +4,7 @@
 /*
   #include <stdio.h>
 
-  #define MOP_IMPLEMENTATION
+  #define MOP_IMPLEMENTATION 1
   #include "mop.h"
 
   int main(int argc, char **argv) {
@@ -12,10 +12,11 @@
     Mop mop = mop_begin_with_usage(argc, argv,
                                    usage_infos,
                                    sizeof usage_infos / sizeof *usage_infos);
-    mop_usage_text(&mop, "Usage: ");
-    mop_usage_text(&mop, argv[0] ? argv[0] : "mop_example");
-    mop_usage_text(&mop, " [OPTION]... [ARG]...\n\n");
+
     MOP_LOOP(&mop) {
+      MOP_TEXT("Usage: ");
+      MOP_TEXT(argv[0] ? argv[0] : "mop_example");
+      MOP_TEXT(" [OPTION]... [ARG]...\n\n");
       MOP_OPT(.name = "output-file", .short_name = 'o',
               .has_arg = true, .optarg_name = "FILE",
               .help = "path of output file") {
@@ -25,7 +26,7 @@
         printf("increasing verbosity\n");
       }
 
-      mop_usage_text(&mop, "\nStandard options:\n");
+      MOP_TEXT("\nStandard options:\n");
       MOP_OPT(.name = "help", .help = "show this help message") {
         mop_print_usage(&mop, stdout);
         exit(0);
@@ -33,7 +34,7 @@
     }
 
     if (mop.error) {
-      fprintf(stderr, "%s: %s\n", mop_error_string(mop.error), mop.erroneous_option);
+      fprintf(stderr, "%s: %s\n", mop_error_string(mop.error), mop.error_detail);
       mop_print_usage(&mop, stderr);
       exit(1);
     }
@@ -51,51 +52,55 @@
 */
 
 // Options can be specified with
-// MOP_OPT(.name = "long-name", .short_name = 'l', .has_arg = true,
-//         .optarg_name = "THING", .help = "sufficiently long name value") {
-//   ...
-// }
+//   MOP_OPT(.name = "long-name", .short_name = 'l', .has_arg = true,
+//           .optarg_name = "THING", .help = "sufficiently long name value") {
+//     ...
+//   }
 // Where all parts are optional.
 //
 // They can also be specified with MOP_STR:
-// MOP_STR("long-name'l:THING", "sufficiently long name value") {
-//   ...
-// }
+//   MOP_STR("long-name'l:THING", "sufficiently long name value") {
+//     ...
+//   }
 // Such that each string option specifier consists of (in order) a long option
 // name, an apostrophe followed by a one-character short option name, and
 // a colon indicating that the option takes an argument (and all parts are
 // optional).
 
 // For options that take an argument, the argument is given in mop.optarg.
-// If an error is encountered, it's given in mop.error; mop.erroneous_option
+// If an error is encountered, it's given in mop.error; mop.error_detail
 // points to the option that caused the error.
 // The index of the first unprocessed argument is given in mop.argind.
 
-// To skip usage message generation, use mop_begin instead of
-// mop_begin_with_usage.
-// To add text to the usage message, use mop_usage_text.
-//
-// Option help text can contain newlines; all lines will be indented to the same
-// level. If the text starts with a newline, the help text will appear on the
-// next line instead of immediately after the option.
+// You can handle unknown long options with MOP_UNKNOWN, which must be at the
+// end of the MOP_LOOP block:
+//   MOP_UNKNOWN() {
+//     if (strcmp(mop.error_detail, "--abc") == 0) {
+//       // Handle option.
+//       mop.opt_active = false;
+//     }
+//   }
+// The unknown option will be in mop.error_detail.
+// The next argument (possibly NULL) will be in mop.optarg; if you use it,
+// increment mop.argind.
+// If you handle the option, set mop.opt_active to false.
+// Note that no parsing of the option name (e.g. to detect --foo=bar arguments)
+// is performed.
+// Unknown short option handling is not supported.
+
+// There are also some convenience functions for parsing common argument types:
+// mop_parse_{u,}intmax parse a string into {u,}intmax_t. They return a value
+// and a success boolean.
+// For now, these are just wrappers around sscanf.
 
 
 // TODO: It's not clear that these macros do enough to justify themselves.
 // Note that the library is usable without any macros.
 
-// TODO: A handler for unknonwn options could be pretty easy to support.
-// Maybe other types of error recovery too?
-
 // TODO: This new MOP_OPT syntax is nicer than MOP_STR, but it's longer.
 // Probably I should just get rid of MOP_STR entirely?
 
-// TODO: MOP_OPT_INT64, MOP_OPT_BOOL, MOP_OPT_STRING, etc. wrappers could be
-// nice for many uses, to automate simple kinds of argument parsing. They could
-// also let the user do additional checking:
-// MOP_OPT_INT64(&x, .name = "arbitrary-value");
-// MOP_OPT_INT64(&y, .name = "constrained-value") {
-//   if (y > 10) { /* error */ }
-// }
+// TODO: Add more convenience functions for specific types. (float, string, bool?)
 
 // TODO: I don't really like the mop_begin_with_usage API (though I do like the
 // part where it doesn't need to allocate). Maybe it should get a flag, and
@@ -118,6 +123,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 typedef struct Mop Mop;
@@ -129,25 +135,28 @@ Mop mop_begin_with_usage(int argc, char **argv, MopUsageInfo *usage_info_buf, in
 bool mop_next(Mop *mop);
 bool mop_option(Mop *mop, MopOptInfo info);
 bool mop_option_str(Mop *mop, char *opt_desc, char *help);
+bool mop_unknown_option(Mop *mop);
 void mop_usage_text(Mop *mop, const char *text);
 void mop_print_usage(Mop *mop, FILE *file);
 
-#define MOP_LOOP(m) for (Mop *mop__ptr = (m); mop_next(mop__ptr); )
-
 #if defined __cplusplus
-  #define MOP_OPT(...) if (mop_option(mop__ptr, MopOptInfo{ __VA_ARGS__ }))
+  #define MOP_OPT_INFO MopOptInfo
 #else
-  #define MOP_OPT(...) if (mop_option(mop__ptr, (MopOptInfo){ __VA_ARGS__ }))
+  #define MOP_OPT_INFO (MopOptInfo)
 #endif
+
+#define MOP_LOOP(m) for (Mop *mop__ptr = (m); mop_next(mop__ptr); )
+#define MOP_OPT(...) if (mop_option(mop__ptr, MOP_OPT_INFO { __VA_ARGS__ }))
 #define MOP_STR(opt, help) if (mop_option_str(mop__ptr, (opt), (help)))
 #define MOP_TEXT(text) mop_usage_text(mop__ptr, (text))
+#define MOP_UNKNOWN() if (mop_unknown_option(mop__ptr))
 
-enum MopError {
+typedef enum MopError {
   MopError_None = 0,
   MopError_UnknownOpt,
   MopError_MissingOptarg,
-  MopError_ExtranousOptarg,
-} typedef MopError;
+  MopError_ExtraneousOptarg,
+} MopError;
 
 const char *mop_error_string(MopError error);
 
@@ -164,10 +173,10 @@ struct MopOptInfo {
   int name_len;
 };
 
-enum MopUsageInfoType {
+typedef enum MopUsageInfoType {
   MopUsageInfoType_OptInfo,
   MopUsageInfoType_Text,
-} typedef MopUsageInfoType;
+} MopUsageInfoType;
 
 struct MopUsageInfo {
   MopUsageInfoType type;
@@ -177,18 +186,18 @@ struct MopUsageInfo {
   };
 };
 
-enum MopState {
+typedef enum MopState {
   MopState_Unstarted = 0,
   MopState_GatheringUsageInfo,
   MopState_Active,
   MopState_Done,
-} typedef MopState;
+} MopState;
 
 struct Mop {
   MopError error;
   MopState state;
 
-  char *erroneous_option;
+  char *error_detail;
 
   char *optarg;
   int argind;
@@ -205,22 +214,41 @@ struct Mop {
   // set to false, so we can detect if an option wasn't handled.
   bool opt_active;
 
-  // A buffer to store an erroneous_option string for short options.
-  char erroneous_option_buf[3];
+  // A buffer to store an error_detail string for short options.
+  char error_detail_buf[3];
 
   // The original argc and argv, as passed to mop_begin.
   int argc;
   char **argv;
 };
 
+
+
+// Convenience functions for parsing special types.
+
+typedef struct MopIntmax {
+  intmax_t value;
+  bool ok;
+} MopIntmax;
+
+typedef struct MopUintmax {
+  uintmax_t value;
+  bool ok;
+} MopUintmax;
+
+MopIntmax mop_parse_intmax(const char *s);
+MopUintmax mop_parse_uintmax(const char *s);
+
 #endif
 
 
-
 #if defined MOP_IMPLEMENTATION
+
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+
 
 Mop mop_begin(int argc, char **argv) {
   Mop mop = {.argc = argc, .argv = argv};
@@ -234,6 +262,19 @@ Mop mop_begin_with_usage(int argc, char **argv,
              .usage_infos_cap = usage_info_buf_cap,
              .argc = argc, .argv = argv};
   return mop;
+}
+
+void mop__option_error(Mop *mop, MopError error) {
+  mop->error = error;
+  char *arg = mop->argv[mop->argind];
+  if (mop->short_opt_index > 0) {
+    snprintf(mop->error_detail_buf, sizeof mop->error_detail_buf,
+             "-%c", arg[mop->short_opt_index]);
+    mop->error_detail = mop->error_detail_buf;
+  } else {
+    assert(mop->argind < mop->argc);
+    mop->error_detail = arg;
+  }
 }
 
 bool mop_next(Mop *mop) {
@@ -257,14 +298,7 @@ bool mop_next(Mop *mop) {
       return false;
     }
     if (mop->opt_active) {
-      mop->error = MopError_UnknownOpt;
-      if (mop->short_opt_index > 0) {
-        char short_name = mop->argv[mop->argind][mop->short_opt_index];
-        snprintf(mop->erroneous_option_buf, sizeof mop->erroneous_option_buf, "-%c", short_name);
-        mop->erroneous_option = mop->erroneous_option_buf;
-      } else {
-        mop->erroneous_option = mop->argv[mop->argind];
-      }
+      mop__option_error(mop, MopError_UnknownOpt);
       mop->state = MopState_Done;
       return false;
     }
@@ -395,26 +429,23 @@ bool mop_option(Mop *mop, MopOptInfo info) {
 
     // Increment short_opt_index here, instead of in mop_next, because we want
     // to handle the {"-ofoo"} and {"-o", "foo"} cases.
-    mop->short_opt_index++;
     if (info.has_arg) {
-      if (arg[mop->short_opt_index] == '\0') {
-        mop->short_opt_index = 0;
-        mop->argind++;
-        if (mop->argind >= mop->argc) {
-          mop->error = MopError_MissingOptarg;
-          snprintf(mop->erroneous_option_buf, sizeof mop->erroneous_option_buf, "-%c", info.short_name);
-          mop->erroneous_option = mop->erroneous_option_buf;
+      if (arg[mop->short_opt_index + 1] == '\0') {
+        if (mop->argind + 1 >= mop->argc) {
+          mop__option_error(mop, MopError_MissingOptarg);
           mop->opt_active = false;
           return false;
         }
+        mop->argind++;
         mop->optarg = mop->argv[mop->argind];
       } else {
-        mop->optarg = arg + mop->short_opt_index;
-        mop->short_opt_index = 0;
+        mop->optarg = arg + mop->short_opt_index + 1;
       }
+      mop->short_opt_index = 0;
       mop->opt_active = false;
       return true;
     } else {
+      mop->short_opt_index++;
       if (arg[mop->short_opt_index] == '\0')
         mop->short_opt_index = 0;
       mop->opt_active = false;
@@ -428,7 +459,9 @@ bool mop_option(Mop *mop, MopOptInfo info) {
   char *arg_long_name = arg + 2;
   char *optarg_sep = strchr(arg_long_name, '=');
   int arg_long_name_len =
-    optarg_sep ? optarg_sep - arg_long_name : strlen(arg_long_name);
+    optarg_sep
+      ? (size_t) (optarg_sep - arg_long_name)
+      : strlen(arg_long_name);
 
   bool option_name_matches =
     arg_long_name_len == info.name_len &&
@@ -439,8 +472,8 @@ bool mop_option(Mop *mop, MopOptInfo info) {
 
   if (!info.has_arg) {
     if (optarg_sep) {
-      mop->error = MopError_ExtranousOptarg;
-      mop->erroneous_option = arg;
+      mop__option_error(mop, MopError_ExtraneousOptarg);
+      mop->opt_active = false;
       return false;
     }
     mop->opt_active = false;
@@ -461,11 +494,29 @@ bool mop_option(Mop *mop, MopOptInfo info) {
     mop->opt_active = false;
     return true;
   } else {
-    mop->error = MopError_MissingOptarg;
-    mop->erroneous_option = arg;
+    mop__option_error(mop, MopError_MissingOptarg);
     mop->opt_active = false;
     return false;
   }
+}
+
+bool mop_unknown_option(Mop *mop) {
+  if (mop->error) return false;
+  if (mop->state != MopState_Active) return false;
+  if (!mop->opt_active) return false;
+
+  if (mop->short_opt_index > 0) {
+    // Short option.
+    return false;
+  }
+
+  char *arg = mop->argv[mop->argind];
+  assert(arg[0] == '-' && arg[1] == '-');
+  mop->error_detail = arg;
+
+  mop->optarg = mop->argv[mop->argind+1];
+
+  return true;
 }
 
 void mop_usage_text(Mop *mop, const char *text) {
@@ -492,24 +543,33 @@ void mop_print_usage(Mop *mop, FILE *file) {
 
   // TODO: A version of this that doesn't use FILE * would be nice.
 
-  // Get the longest option name length, to align the help text.
-  int longest_long_name_len = 0;
+  // Figure out the help text column for the longest option, to align the help text.
+  int inline_help_text_column = 0;
   for (int i = 0; i < mop->usage_infos_len; i++) {
     if (mop->usage_infos[i].type != MopUsageInfoType_OptInfo) continue;
     MopOptInfo *opt_info = &mop->usage_infos[i].opt_info;
     if (!opt_info->help || *opt_info->help == '\n') continue;
 
-    int this_option_len = opt_info->name_len;
-    if (opt_info->has_arg) {
-      this_option_len += 1;
-      this_option_len += opt_info->optarg_name ? strlen(opt_info->optarg_name)
-                                               : strlen("ARG");
+    int this_option_text_column = 10;
+
+    bool has_short = opt_info->short_name;
+    bool has_long = opt_info->name;
+    size_t optarg_name_len = opt_info->optarg_name ? strlen(opt_info->optarg_name) : strlen("ARG");
+
+    if (has_long) {
+      this_option_text_column += opt_info->name_len;
+      if (opt_info->has_arg) {
+        this_option_text_column += 1 + optarg_name_len;
+      }
+    } else if (has_short && opt_info->has_arg) {
+      this_option_text_column += optarg_name_len;
+      this_option_text_column -= 3;
     }
-    if (longest_long_name_len < this_option_len) {
-      longest_long_name_len = this_option_len;
+
+    if (inline_help_text_column < this_option_text_column) {
+      inline_help_text_column = this_option_text_column;
     }
   }
-  int inline_help_text_column = longest_long_name_len + 10;
 
   for (int i = 0; i < mop->usage_infos_len; i++) {
     MopUsageInfo *info = &mop->usage_infos[i];
@@ -525,6 +585,9 @@ void mop_print_usage(Mop *mop, FILE *file) {
       int line_len = 0;
       if (has_short) {
         line_len += fprintf(file, "  -%c", opt_info->short_name);
+        if (!has_long && opt_info->has_arg) {
+          line_len += fprintf(file, " %s", opt_info->optarg_name ? opt_info->optarg_name : "ARG");
+        }
       } else {
         line_len += fprintf(file, "    ");
       }
@@ -553,9 +616,7 @@ void mop_print_usage(Mop *mop, FILE *file) {
 
         while (1) {
           int required_padding = text_column - line_len;
-          for (int j = 0; j < required_padding; j++) {
-            fputc(' ', file);
-          }
+          fprintf(file, "%*s", required_padding, ""); // Print n spaces.
 
           const char *end = strchr(s, '\n');
           if (!end) {
@@ -594,6 +655,30 @@ static const char *mop_error_string_table[] = {
 
 const char *mop_error_string(MopError error) {
   return mop_error_string_table[error];
+}
+
+MopIntmax mop_parse_intmax(const char *s) {
+  MopIntmax result = {0};
+  int bytes_read = 0;
+  errno = 0;
+  sscanf(s, "%jd%n", &result.value, &bytes_read);
+  if (errno == 0 && (size_t) bytes_read == strlen(s)) {
+    result.ok = true;
+  }
+
+  return result;
+}
+
+MopUintmax mop_parse_uintmax(const char *s) {
+  MopUintmax result = {0};
+  int bytes_read = 0;
+  errno = 0;
+  sscanf(s, "%ju%n", &result.value, &bytes_read);
+  if (errno == 0 && (size_t) bytes_read == strlen(s)) {
+    result.ok = true;
+  }
+
+  return result;
 }
 
 #endif

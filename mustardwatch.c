@@ -719,7 +719,7 @@ Options:\n\
       }
     }
     if (mop.error) {
-      fprintf(stderr, "%s: %s\n", mop_error_string(mop.error), mop.erroneous_option);
+      fprintf(stderr, "%s: %s\n", mop_error_string(mop.error), mop.error_detail);
       mop_print_usage(&mop, stderr);
       exit(1);
     }
