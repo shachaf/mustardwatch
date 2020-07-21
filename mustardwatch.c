@@ -285,7 +285,7 @@ TraceeEvent translate_ptrace_event(int wstatus) {
     }
   }
 
-  fprintf(stderr, "unknown ptrace event!");
+  fprintf(stderr, "unknown ptrace event! wstatus: %d\n", wstatus);
   exit(1);
 }
 
@@ -732,7 +732,7 @@ Options:\n\
     if (state.out_path) {
       state.out_file = fopen(state.out_path, "w");
       if (!state.out_file) {
-        fprintf(stderr, "could not open %s: %s", state.out_path, strerror(errno));
+        fprintf(stderr, "could not open %s: %s\n", state.out_path, strerror(errno));
         exit(1);
       }
     }
