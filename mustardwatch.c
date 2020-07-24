@@ -5,12 +5,12 @@
 // There are many things that access files that this program doesn't track.
 // For the most part it only looks for files opened for reading, or checked with
 // stat.
-// It doesn't track:
+// In particular, it doesn't track:
+// * Files opened for writing
 // * Files that exist at startup (like stdin)
 // * rename, chmod, unlink, mkdir, bind, mknod, etc.
-// * execve, etc.
 // * Files opened via io_uring?
-// * Files monitored via inotify? (Seems like a bad idea!)
+// * Files monitored via inotify? (Seems redundant?)
 // * Many things no one knows about like name_to_handle_at and open_tree?
 // * File descriptors received over domain sockets?
 
@@ -20,6 +20,7 @@
 // TODO: watch_abs_path uses realpath(), which resolves symbolic links, which
 // means that changes to symbolic links themselves aren't tracked. Maybe they
 // should be?
+// (If so, it would probably be good to look at AT_SYMLINK_{NO,}FOLLOW too.)
 
 // TODO: It might make sense not to watch files that are written to by a tracee
 // -- e.g. a common build process is to have a compiler write .o files and then
@@ -218,6 +219,7 @@ Struct(State) {
   char *out_path;
   FILE *out_file;
 
+  sigset_t orig_sigmask;
   int inotify_fd;
   int signal_fd;
   int child_pid;
@@ -334,6 +336,11 @@ void tracee_continue_normal_execution(Tracee *tracee, TraceeEvent ev) {
 
 
 // How does a program use a file?
+// Right now, the distinction is: If a program opens a directory, and we're in
+// directory-watching mode, we watch the directory (under that assumption it
+// opened it for getdents). If it only checks the directory, we don't.
+// TODO: It may make sense to watch the directory itself (but not its contents)
+// even when the directory is checked.
 Enum(UseType) {
   UseType_Open, // E.g. openat
   UseType_Check, // E.g. stat, readlink
@@ -434,6 +441,8 @@ bool should_watch_resolved_path(State *state, char *path, UseType use_type) {
 
 void handle_path_at(State *state, Tracee *tracee, UseType use_type,
                    int at_fd, U64 path_addr) {
+  // Paths are capped at PATH_MAX (4096). If a path is longer, we'll truncate
+  // it, and probably silently fail to track it, which seems fine.
   char path[PATH_MAX];
   bool found = read_tracee_string(tracee->pid, path_addr, path, PATH_MAX);
   if (!found) {
@@ -530,6 +539,10 @@ void handle_syscall(State *state, Tracee *tracee) {
   U64 syscall_number = regs.orig_rax;
   U64 args[6] = {regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9};
 
+  // Some of the *at system calls can operate on fds instead of paths (with ""
+  // as the path and AT_EMPTY_PATH in the flags). We don't care about watching
+  // fds, so we just treat it as an empty path, which handle_path_at ignores.
+
   switch (syscall_number) {
   Case __NR_open:
     // For open/openat: Skip files opened for writing, and directories.
@@ -545,9 +558,6 @@ void handle_syscall(State *state, Tracee *tracee) {
   Case __NR_lstat:
     handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
   Case __NR_newfstatat:
-    // fstatat/statx might be used with AT_EMPTY_PATH and an empty path; we don't
-    // care about watching fds so we'll just treat it as an empty string (and
-    // ignore it).
     handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
   Case __NR_statx:
     handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
@@ -563,6 +573,11 @@ void handle_syscall(State *state, Tracee *tracee) {
     handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
   Case __NR_readlinkat:
     handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
+  Case __NR_execve:
+    handle_path_at(state, tracee, UseType_Check, AT_FDCWD, args[0]);
+  Case __NR_execveat:
+    handle_path_at(state, tracee, UseType_Check, cast(int) args[0], args[1]);
+  // These system calls are too new:
   //Case __NR_faccessat2:
   //Case __NR_readfile:
   }
@@ -613,8 +628,13 @@ void run_program(State *state) {
   if (child_pid < 0) die("fork error");
 
   if (child_pid == 0) {
-    // Child. Stop ourselves to let the parent trace us.
-    int r = kill(getpid(), SIGSTOP);
+    // We're the child. Reset the signal mask, then stop ourselves to let the
+    // parent trace us.
+
+    int r = sigprocmask(SIG_SETMASK, &state->orig_sigmask, 0);
+    if (r < 0) die("resetting sigprocmask");
+
+    r = kill(getpid(), SIGSTOP);
     if (r < 0) die("kill($$, SIGSTOP)");
 
     execvp(state->program_argv[0], state->program_argv);
@@ -638,7 +658,15 @@ void run_program(State *state) {
 
   // Seize the child. This doesn't stop it (but it's already stopped).
   long res = ptrace(PTRACE_SEIZE, state->child_pid, 0, flags);
-  if (res < 0) die("ptrace (SEIZE) error");
+  if (res < 0) {
+    fprintf(stderr, "ptrace (SEIZE) error: %s\n", strerror(errno));
+
+    // We couldn't seize the child (ptrace_scope permissions?). Kill it.
+    int r = kill(state->child_pid, SIGKILL);
+    if (r < 0) die("unable to kill child");
+
+    exit(1);
+  }
 
   add_tracee(state, state->child_pid, TraceeState_Running);
 
@@ -740,11 +768,11 @@ Options:\n\
     state.program_argv = argv + mop.argind;
   }
 
-  // Set up a blocked signal handler for SIGCHLD.
+  // Block SIGCHLD, and handle it via signalfd.
   sigset_t sigchld_mask;
   sigemptyset(&sigchld_mask);
   sigaddset(&sigchld_mask, SIGCHLD);
-  int r = sigprocmask(SIG_BLOCK, &sigchld_mask, 0);
+  int r = sigprocmask(SIG_BLOCK, &sigchld_mask, &state.orig_sigmask);
   if (r < 0) die("sigprocmask");
 
   state.signal_fd = signalfd(-1, &sigchld_mask, SFD_CLOEXEC|SFD_NONBLOCK);
@@ -785,7 +813,7 @@ Options:\n\
         }
       }
 
-      // If the program is still running, ignore inotify events. Many build
+      // If the program is still running, don't do anything. Many build
       // processes do things like write to a .o file from one process and read
       // from it in another, so unless we detect that (e.g. by noting which
       // files they wrote to, and ignoring those), that would cause too many

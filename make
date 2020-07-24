@@ -5,7 +5,8 @@ set -euo pipefail
 cc=clang
 
 cflags=()
-cflags+=(-Wall -Wextra -g)
+cflags+=(-Wall -Wextra)
+cflags+=(-g)
 cflags+=(-O2)
 
 mkdir -p build
