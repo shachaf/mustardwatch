@@ -733,7 +733,7 @@ Options:\n\
       MOP_OPT(.name = "out", .short_name = 'o',
               .help = "rather than respawning the process when files change,\n"
                       "  write out a list of watched files to FILE, then exit",
-              .has_arg = true, .optarg_name = "FILE") {
+              .param = "FILE") {
         state.out_path = mop.optarg;
       }
       MOP_OPT(.name = "verbose", .short_name = 'v',
