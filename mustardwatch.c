@@ -77,6 +77,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef IN_MASK_CREATE
+  #define IN_MASK_CREATE 0x20000000
+#endif
+
 #define MOP_IMPLEMENTATION 1
 #include "extern/mop.h"
 
