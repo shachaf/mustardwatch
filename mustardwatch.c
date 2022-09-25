@@ -614,6 +614,38 @@ int add_tracee(State *state, pid_t pid, TraceeState tracee_state) {
   return tracee_index;
 }
 
+void print_shell_escaped(char *str) {
+  bool str_needs_escaping = false;
+  for (char *c = str; *c; c++) {
+    bool allowed_unescaped =
+      ('a' <= *c && *c <= 'z') ||
+      ('A' <= *c && *c <= 'Z') ||
+      ('0' <= *c && *c <= '9') ||
+      *c == '-' || *c == '=' ||
+      *c == '.' || *c == '/' ||
+      *c == '_' ||
+      *c == '+' || *c == ':' ||
+      *c == '@' || *c == '%';
+    if (!allowed_unescaped) {
+      str_needs_escaping = true;
+      break;
+    }
+  }
+  if (str_needs_escaping) {
+    putchar('\'');
+    for (char *c = str; *c; c++) {
+      if (*c == '\'') {
+        printf("'\\''");
+      } else {
+        putchar(*c);
+      }
+    }
+    putchar('\'');
+  } else {
+    printf("%s", str);
+  }
+}
+
 void run_program(State *state) {
   if (state->clear) {
     printf("\033[H\033[J\033[2J\033[3J");
@@ -623,7 +655,8 @@ void run_program(State *state) {
   if (state->verbose > 0) {
     printf("mustardwatch: Running");
     for (char **arg = state->program_argv; *arg; arg++) {
-      printf(" %s", *arg);
+      putchar(' ');
+      print_shell_escaped(*arg);
     }
     printf("\n");
   }
